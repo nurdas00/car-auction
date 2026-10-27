@@ -8,6 +8,8 @@ import (
 
 	"autoauction/internal/bid"
 	"autoauction/internal/lot"
+	"autoauction/internal/notify"
+	"autoauction/internal/user"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -18,26 +20,73 @@ type Manager struct {
 	mu    sync.Mutex
 	rooms map[uuid.UUID]*Room
 
-	pool *pgxpool.Pool
-	lots *lot.Repo
-	bids *bid.Repo
+	pool     *pgxpool.Pool
+	lots     *lot.Repo
+	bids     *bid.Repo
+	users    *user.Repo
+	notifier notify.Notifier
 }
 
-func NewManager(pool *pgxpool.Pool, lots *lot.Repo, bids *bid.Repo) *Manager {
-	return &Manager{rooms: make(map[uuid.UUID]*Room), pool: pool, lots: lots, bids: bids}
+func NewManager(pool *pgxpool.Pool, lots *lot.Repo, bids *bid.Repo, users *user.Repo, notifier notify.Notifier) *Manager {
+	return &Manager{
+		rooms: make(map[uuid.UUID]*Room), pool: pool, lots: lots, bids: bids,
+		users: users, notifier: notifier,
+	}
 }
 
 // StartRoom запускает комнату для лота, уже переведённого в status=active
 // (вызывается сразу после Approve).
 func (m *Manager) StartRoom(l *lot.Lot) {
+	if l.ListingType != lot.ListingTypeAuction {
+		return // витрина с фиксированной ценой не торгуется
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, exists := m.rooms[l.ID]; exists {
 		return
 	}
-	room := newRoom(l, m.pool, m.lots, m.bids, m.removeRoom)
+	room := newRoom(l, m.pool, m.lots, m.bids, m.users, m.notifier, m.removeRoom)
 	m.rooms[l.ID] = room
 	go room.run()
+}
+
+// Cancel снимает активный лот с публикации по решению админа (ТЗ раздел 4.6):
+// останавливает комнату немедленно, минуя обычную бизнес-логику finish()
+// (резерв/наличие ставок) — итог принудительный, независимо от текущих ставок.
+// Дожидается фактического результата записи в БД — иначе вызывающий код
+// (HTTP-хендлер) мог бы отрапортовать об успехе до того, как отмена
+// действительно сохранилась (см. code review).
+func (m *Manager) Cancel(ctx context.Context, lotID uuid.UUID) error {
+	room, ok := m.getRoom(lotID)
+	if !ok {
+		// Лот с фиксированной ценой не торгуется и Room для него не создаётся
+		// (см. StartRoom/Resume) — отменяем его прямой записью в БД, минуя
+		// Room-машинерию, которая для него и не нужна (см. code review).
+		l, err := m.lots.GetByID(ctx, lotID)
+		if err != nil || l.ListingType != lot.ListingTypeFixedPrice {
+			return ErrLotNotActive
+		}
+		if err := m.lots.Finalize(ctx, lotID, lot.StatusCancelled); err != nil {
+			return ErrLotNotActive
+		}
+		return nil
+	}
+
+	respCh := make(chan error, 1)
+	select {
+	case room.cancelCh <- respCh:
+	case <-room.done:
+		return ErrLotNotActive
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	select {
+	case err := <-respCh:
+		return err
+	case <-room.done:
+		return ErrLotNotActive
+	}
 }
 
 func (m *Manager) removeRoom(lotID uuid.UUID) {
@@ -58,12 +107,15 @@ func (m *Manager) getRoom(lotID uuid.UUID) (*Room, bool) {
 // (сервер был выключен дольше, чем оставалось до конца торгов), финализируются
 // немедленно без повторного прогона таймера.
 func (m *Manager) Resume(ctx context.Context) error {
-	activeLots, err := m.lots.ListActive(ctx)
+	activeLots, err := m.lots.ListActive(ctx, lot.Filter{}) // без лимита — нужны все активные лоты
 	if err != nil {
 		return err
 	}
 	for i := range activeLots {
 		l := activeLots[i]
+		if l.ListingType != lot.ListingTypeAuction {
+			continue // витрина с фиксированной ценой не торгуется — Room ей не нужна
+		}
 		if l.EndAt != nil && !time.Now().Before(*l.EndAt) {
 			if err := m.finalizeExpired(ctx, &l); err != nil {
 				log.Printf("auction: finalize expired lot %s on resume: %v", l.ID, err)
@@ -80,11 +132,16 @@ func (m *Manager) finalizeExpired(ctx context.Context, l *lot.Lot) error {
 	if err != nil {
 		return err
 	}
-	status := lot.StatusFinishedUnsold
-	if hadBid && (l.ReservePriceKGS == nil || (l.CurrentPriceKGS != nil && *l.CurrentPriceKGS >= *l.ReservePriceKGS)) {
-		status = lot.StatusFinishedSold
+	currentPriceKGS := l.StartPriceKGS
+	if l.CurrentPriceKGS != nil {
+		currentPriceKGS = *l.CurrentPriceKGS
 	}
-	return m.lots.Finalize(ctx, l.ID, status)
+	status := decideOutcome(hadBid, currentPriceKGS, l.ReservePriceKGS)
+	if err := m.lots.Finalize(ctx, l.ID, status); err != nil {
+		return err
+	}
+	sendFinishNotifications(ctx, m.notifier, m.users, m.bids, l.ID, l.SellerID, status, currentPriceKGS)
+	return nil
 }
 
 type BidOutcome struct {

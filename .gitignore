@@ -1,0 +1,6 @@
+# unlazy: local gate state and Stop-hook settings
+.unlazy/
+.unlazy-hook-state.json
+unlazy-status.log
+.claude/settings.local.json
+.claude/settings.local.json.unlazy.bak

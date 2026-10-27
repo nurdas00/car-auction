@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -12,8 +13,10 @@ import (
 	"autoauction/internal/bid"
 	"autoauction/internal/config"
 	"autoauction/internal/db"
+	"autoauction/internal/favorite"
 	"autoauction/internal/httpapi"
 	"autoauction/internal/lot"
+	"autoauction/internal/notify"
 	"autoauction/internal/user"
 
 	"github.com/joho/godotenv"
@@ -37,20 +40,28 @@ func main() {
 		log.Fatalf("migrations: %v", err)
 	}
 
+	if err := os.MkdirAll(cfg.UploadsDir, 0o755); err != nil {
+		log.Fatalf("uploads dir: %v", err)
+	}
+
 	lotsRepo := lot.NewRepo(pool)
 	bidsRepo := bid.NewRepo(pool)
-	auctionMgr := auction.NewManager(pool, lotsRepo, bidsRepo)
+	usersRepo := user.NewRepo(pool)
+	auctionMgr := auction.NewManager(pool, lotsRepo, bidsRepo, usersRepo, notify.LogNotifier{})
 	if err := auctionMgr.Resume(ctx); err != nil {
 		log.Fatalf("auction resume: %v", err)
 	}
 
 	server := &httpapi.Server{
-		JWTSecret: cfg.JWTSecret,
-		JWTTTL:    cfg.JWTTTL,
-		Users:     user.NewRepo(pool),
-		Lots:      lotsRepo,
-		Bids:      bidsRepo,
-		Auction:   auctionMgr,
+		JWTSecret:   cfg.JWTSecret,
+		JWTTTL:      cfg.JWTTTL,
+		CORSOrigins: cfg.CORSOrigins,
+		UploadsDir:  cfg.UploadsDir,
+		Users:       usersRepo,
+		Lots:        lotsRepo,
+		Bids:        bidsRepo,
+		Favorites:   favorite.NewRepo(pool),
+		Auction:     auctionMgr,
 	}
 
 	httpServer := &http.Server{

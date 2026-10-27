@@ -7,7 +7,6 @@ import (
 
 	"autoauction/internal/auction"
 	"autoauction/internal/auth"
-	"autoauction/internal/lot"
 )
 
 type placeBidRequest struct {
@@ -59,16 +58,7 @@ func (s *Server) handleListBids(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// Та же проверка видимости, что и у самого лота (handleGetLot) — иначе
-	// историю ставок по приватному draft/pending лоту мог увидеть кто угодно.
-	l, err := s.Lots.GetByID(r.Context(), id)
-	if err != nil {
-		writeNotFoundOrError(w, err, lot.ErrForbidden)
-		return
-	}
-	userID := auth.UserIDFromContext(r.Context())
-	if !canViewLot(l, userID, auth.RoleFromContext(r.Context())) {
-		writeError(w, http.StatusForbidden, "not allowed to view this lot")
+	if _, ok := s.loadViewableLot(w, r, id); !ok {
 		return
 	}
 

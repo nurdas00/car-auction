@@ -83,6 +83,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "invalid email or password")
 		return
 	}
+	if u.IsBlocked {
+		writeError(w, http.StatusForbidden, "account is blocked")
+		return
+	}
 
 	token, err := auth.GenerateToken(s.JWTSecret, s.JWTTTL, u.ID, u.Role)
 	if err != nil {

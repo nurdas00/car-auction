@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"net/http"
+	"strings"
 
 	"autoauction/internal/auth"
 
@@ -9,6 +10,20 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 )
+
+// wsOriginPatterns переводит CORSOrigins ("http://localhost:3000") в формат
+// websocket.AcceptOptions.OriginPatterns, который матчится против хоста без схемы.
+func (s *Server) wsOriginPatterns() []string {
+	patterns := make([]string, 0, len(s.CORSOrigins))
+	for _, o := range s.CORSOrigins {
+		o = strings.TrimPrefix(o, "http://")
+		o = strings.TrimPrefix(o, "https://")
+		if o != "" {
+			patterns = append(patterns, o)
+		}
+	}
+	return patterns
+}
 
 // handleLotWS транслирует живые обновления лота (цена, таймер, anti-snipe,
 // завершение торгов). Ставки принимаются через REST POST /api/lots/{id}/bids —
@@ -23,8 +38,17 @@ func (s *Server) handleLotWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	token := r.URL.Query().Get("token")
-	if _, err := auth.ParseToken(s.JWTSecret, token); err != nil {
+	claims, err := auth.ParseToken(s.JWTSecret, token)
+	if err != nil {
 		http.Error(w, "invalid token", http.StatusUnauthorized)
+		return
+	}
+	// Этот маршрут живёт вне группы с requireActiveUser (ws не проходит через
+	// обычную цепочку middleware), поэтому блокировку проверяем здесь явно —
+	// иначе заблокированный пользователь мог бы продолжать смотреть живые
+	// торги по старому токену (см. code review).
+	if blocked, err := s.Users.IsBlocked(r.Context(), claims.UserID); err != nil || blocked {
+		http.Error(w, "account is blocked", http.StatusForbidden)
 		return
 	}
 
@@ -37,7 +61,13 @@ func (s *Server) handleLotWS(w http.ResponseWriter, r *http.Request) {
 	// Accept ниже подписчик навсегда останется висеть в комнате (см. code review).
 	defer sub.Unsubscribe()
 
-	conn, err := websocket.Accept(w, r, nil)
+	// websocket.Accept по умолчанию принимает только одноимённые (same-origin)
+	// запросы — иначе отклоняет апгрейд без явного CORS-preflight (WS его не
+	// использует). Фронтенд в деве живёт на другом порту (3000 vs 8080),
+	// поэтому разрешаем те же origin'ы, что и обычным HTTP-запросам.
+	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+		OriginPatterns: s.wsOriginPatterns(),
+	})
 	if err != nil {
 		return
 	}
